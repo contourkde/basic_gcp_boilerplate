@@ -1,0 +1,138 @@
+name: 'Terraform CI/CD'
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  TF_LOG: INFO
+
+jobs:
+  validate:
+    name: 'Validate'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: "1.0.0"
+
+    - name: Setup OPA
+      run: |
+        curl -L -o opa https://openpolicyagent.org/downloads/v0.42.0/opa_linux_amd64_static
+        chmod 755 ./opa
+        sudo mv opa /usr/local/bin/
+
+    - name: Install tflint
+      run: |
+        curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+
+    - name: Install tfsec
+      run: |
+        curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      
+    - name: TFLint
+      run: |
+        tflint --init
+        tflint --recursive
+
+    - name: TFSec
+      run: tfsec .
+
+    - name: OPA Policy Check
+      run: |
+        for env in dev prod; do
+          cd environments/$env
+          terraform init -backend=false
+          terraform plan -out=tfplan.binary
+          terraform show -json tfplan.binary > tfplan.json
+          opa eval --format pretty --data ../../policies/opa/compute.rego --input tfplan.json "data.terraform.compute"
+          cd ../..
+        done
+
+  plan:
+    name: 'Plan'
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, prod]
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: "1.0.0"
+
+    - name: Configure GCP Credentials
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Terraform Init
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform init
+
+    - name: Terraform Plan
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform plan -out=tfplan
+      env:
+        TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+        TF_VAR_service_account_email: ${{ secrets.GCP_SA_EMAIL }}
+
+  apply:
+    name: 'Apply'
+    needs: plan
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    strategy:
+      matrix:
+        environment: [dev, prod]
+    
+    environment:
+      name: ${{ matrix.environment }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: "1.0.0"
+
+    - name: Configure GCP Credentials
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Terraform Init
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform init
+
+    - name: Terraform Apply
+      run: |
+        cd environments/${{ matrix.environment }}
+        terraform apply -auto-approve
+      env:
+        TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+        TF_VAR_service_account_email: ${{ secrets.GCP_SA_EMAIL }}
